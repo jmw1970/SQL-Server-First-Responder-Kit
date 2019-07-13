@@ -1,4 +1,21 @@
-﻿
+DECLARE @msg NVARCHAR(MAX) = N'';
+
+	-- Must be a compatible, on-prem version of SQL (2014+)
+IF  (	(SELECT SERVERPROPERTY ('EDITION')) <> 'SQL Azure' 
+	AND (SELECT PARSENAME(CONVERT(NVARCHAR(128), SERVERPROPERTY ('PRODUCTVERSION')), 4)) < 12
+	)
+	-- or Azure Database (not Azure Data Warehouse), running at database compat level 120+
+OR	(	(SELECT SERVERPROPERTY ('EDITION')) = 'SQL Azure'
+	AND (SELECT SERVERPROPERTY ('ENGINEEDITION')) = 5
+	AND (SELECT [compatibility_level] FROM sys.databases WHERE [name] = DB_NAME()) < 120
+	)
+BEGIN
+	SELECT @msg = N'Sorry, sp_BlitzInMemoryOLTP doesn''t work on versions of SQL prior to 2014.' + REPLICATE(CHAR(13), 7933);
+	PRINT @msg;
+	RETURN;
+END;
+
+
 IF OBJECT_ID('dbo.sp_BlitzInMemoryOLTP', 'P') IS NULL
 EXECUTE ('CREATE PROCEDURE dbo.sp_BlitzInMemoryOLTP AS SELECT 1;');
 GO
@@ -8,7 +25,9 @@ ALTER PROCEDURE dbo.sp_BlitzInMemoryOLTP(
       , @dbName            NVARCHAR(4000) = N'ALL'
       , @tableName         NVARCHAR(4000) = NULL
       , @debug             BIT            = 0
-	  , @VersionDate DATETIME = NULL OUTPUT
+	  , @Version           VARCHAR(30)    = NULL OUTPUT
+	  , @VersionDate       DATETIME       = NULL OUTPUT
+      , @VersionCheckMode  BIT            = 0
 )
 /*
 .SYNOPSIS
@@ -62,10 +81,15 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 */
 AS 
-DECLARE @Version VARCHAR(30);
-SET @Version = '1.6';
-SET @VersionDate = '20180601';
+DECLARE @ScriptVersion VARCHAR(30);
+SELECT @ScriptVersion = '1.9', @VersionDate = '20190702';
 
+IF(@VersionCheckMode = 1)
+BEGIN
+    SET @Version = @ScriptVersion;
+	RETURN;
+END;
+								
 BEGIN TRY
 
     SET NOCOUNT ON;
@@ -77,15 +101,9 @@ BEGIN TRY
     DECLARE @Edition NVARCHAR(MAX) = CAST(SERVERPROPERTY('Edition') AS NVARCHAR(128))
           , @errorMessage  NVARCHAR(512);
 
-    DECLARE @Version INT = CONVERT(INT, SERVERPROPERTY('ProductMajorVersion'));
+    DECLARE @MSSQLVersion INT = CONVERT(INT, SERVERPROPERTY('ProductMajorVersion'));
 
-    IF @debug = 1 PRINT('--@Version = ' + CAST(@Version AS VARCHAR(30)));
-
-    IF @Version < 12
-    BEGIN
-        SET @errorMessage = CONCAT('In-Memory OLTP is not supported if SQL Server version is less than 2014. You are running SQL Server version: ', @Version);
-        THROW 55000, @errorMessage, 1;
-    END;
+    IF @debug = 1 PRINT('--@MSSQLVersion = ' + CAST(@MSSQLVersion AS VARCHAR(30)));
 
     /*
     ###################################################
@@ -122,7 +140,7 @@ BEGIN TRY
 
     -- not on Azure, so we need to check versions/Editions
     -- SQL 2014 only supports XTP on Enterprise edition
-    IF (SERVERPROPERTY('EngineEdition') IN (2, 4)) AND @Version = 12 AND (@Edition NOT LIKE 'Enterprise%' AND  @Edition NOT LIKE 'Developer%')
+    IF (SERVERPROPERTY('EngineEdition') IN (2, 4)) AND @MSSQLVersion = 12 AND (@Edition NOT LIKE 'Enterprise%' AND  @Edition NOT LIKE 'Developer%')
     BEGIN
         SET @errorMessage = CONCAT('For SQL 2014, In-Memory OLTP is only suppported on Enterprise Edition. You are running SQL Server edition: ', @Edition);
         THROW 55002, @errorMessage, 1;
@@ -132,7 +150,7 @@ BEGIN TRY
     -- SQL 2016 non-Enterprise only supports XTP after SP1
     DECLARE @BuildString VARCHAR(4) = CONVERT(VARCHAR(4), SERVERPROPERTY('ProductBuild'));
     
-    IF (SERVERPROPERTY('EngineEdition') IN (2, 4)) AND @Version = 13 AND (@BuildString < 4001)
+    IF (SERVERPROPERTY('EngineEdition') IN (2, 4)) AND @MSSQLVersion = 13 AND (@BuildString < 4001)
     -- 13.0.4001.0 is the minimum build for XTP support
     BEGIN
         SET @errorMessage = 'For SQL 2016, In-Memory OLTP is only suppported on non-Enterprise Edition as of SP1';
@@ -296,7 +314,7 @@ BEGIN TRY
        ,end_time DATETIME
        ,xtp_storage_percent DECIMAL(5, 2)
 
-    )
+    );
     
     CREATE TABLE #resultsContainerDetails 
     (
@@ -306,7 +324,7 @@ BEGIN TRY
         ,container_id BIGINT
         ,sizeMB NVARCHAR(256)
         ,fileCount INT 
-    )
+    );
 
     CREATE TABLE #resultsContainerFileDetails 
     (
@@ -320,7 +338,7 @@ BEGIN TRY
         ,sizeGB NVARCHAR(256) 
         ,fileCount INT 
         ,fileGroupState NVARCHAR(256)
-    )
+    );
 
     CREATE TABLE #resultsContainerFileSummary 
     (
@@ -332,7 +350,8 @@ BEGIN TRY
         ,sizeMB NVARCHAR(256)
         ,fileCount INT 
         ,fileGroupState NVARCHAR(256)
-    )
+    );
+
     IF OBJECT_ID('tempdb..#inmemDatabases') IS NOT NULL DROP TABLE #inmemDatabases;
     
     /*
@@ -656,7 +675,7 @@ BEGIN TRY
                     ,', b.name AS tableName 
                     , p.rows AS [rowCount]
                     ,durability_desc '
-                    ,CASE WHEN @Version >= 13 THEN ', temporal_type_desc ' ELSE ',NULL AS temporal_type_desc' END
+                    ,CASE WHEN @MSSQLVersion >= 13 THEN ', temporal_type_desc ' ELSE ',NULL AS temporal_type_desc' END
                     ,', FORMAT(memory_allocated_for_table_kb, ''###,###,###'') AS memoryAllocatedForTableKB
                     ,FORMAT(memory_used_by_table_kb, ''###,###,###'') AS memoryUsedByTableKB
                     ,FORMAT(memory_allocated_for_indexes_kb, ''###,###,###'') AS memoryAllocatedForIndexesKB
@@ -727,13 +746,13 @@ BEGIN TRY
                     INNER JOIN '
                     ,dbName
                     ,'.sys.tables t ON t.object_id = c.object_id'
-                    ,CASE WHEN @Version > 12 THEN ' INNER JOIN sys.memory_optimized_tables_internal_attributes a ON a.object_id = c.object_id
+                    ,CASE WHEN @MSSQLVersion > 12 THEN ' INNER JOIN sys.memory_optimized_tables_internal_attributes a ON a.object_id = c.object_id
                                                                             AND a.xtp_object_id = c.xtp_object_id' ELSE NULL END
                     ,@crlf + ' LEFT JOIN '
                     ,dbName 
                     ,'.sys.indexes i ON c.object_id = i.object_id
                                                     AND c.index_id = i.index_id '
-                                                    ,CASE WHEN @Version > 12 THEN 'AND a.minor_id = 0' ELSE NULL END
+                                                    ,CASE WHEN @MSSQLVersion > 12 THEN 'AND a.minor_id = 0' ELSE NULL END
                     ,@crlf + ' WHERE t.type = '
                     , '''u'''
                     , '   AND t.is_memory_optimized = 1 '
@@ -807,7 +826,7 @@ BEGIN TRY
                     INNER JOIN '
                     ,dbName
                     ,'.sys.indexes AS i ON h.object_id = i.object_id AND h.index_id = i.index_id'
-                    ,CASE WHEN @Version > 12 THEN
+                    ,CASE WHEN @MSSQLVersion > 12 THEN
                     CONCAT(' INNER JOIN ', dbName ,'.sys.memory_optimized_tables_internal_attributes ia ON h.xtp_object_id = ia.xtp_object_id') ELSE NULL END
                     ,' INNER JOIN '
                     ,dbName
@@ -815,7 +834,7 @@ BEGIN TRY
                     ,' INNER JOIN '
                     ,dbName
                     ,'.sys.schemas sch ON sch.schema_id = t.schema_id '
-                    ,CASE WHEN @Version > 12 THEN 'WHERE ia.type = 1' ELSE NULL END
+                    ,CASE WHEN @MSSQLVersion > 12 THEN 'WHERE ia.type = 1' ELSE NULL END
                 )
             FROM #MemoryOptimizedDatabases
             WHERE rowNumber = @dbCounter;
@@ -867,14 +886,14 @@ BEGIN TRY
                     INNER JOIN '
                     ,dbName
                     ,'.sys.tables t ON t.object_id = c.object_id'
-                    ,CASE WHEN @Version > 12 THEN
+                    ,CASE WHEN @MSSQLVersion > 12 THEN
                     CONCAT(' INNER JOIN ', dbName ,'.sys.memory_optimized_tables_internal_attributes a ON a.object_id = c.object_id
                                                                         AND a.xtp_object_id = c.xtp_object_id') ELSE NULL END 
                     ,' LEFT JOIN '
                     ,dbName 
                     ,'.sys.indexes i ON c.object_id = i.object_id
                                                     AND c.index_id = i.index_id '
-                                                    ,CASE WHEN @Version > 12 THEN ' AND a.minor_id = 0' ELSE NULL END
+                                                    ,CASE WHEN @MSSQLVersion > 12 THEN ' AND a.minor_id = 0' ELSE NULL END
                     ,' WHERE t.type = '
                     , '''u'''
                     , '   AND t.is_memory_optimized = 1 '
@@ -1003,8 +1022,8 @@ BEGIN TRY
                             SELECT DISTINCT REPLACE(value, ''.dll'', '''') AS object_id
                             FROM #moduleSplit
                             WHERE rowNumber % ' 
-                     ,CASE WHEN @Version = 12 THEN ' 4 = 0'
-                           ELSE ' 6 = 4'  -- @Version >= 13 
+                     ,CASE WHEN @MSSQLVersion = 12 THEN ' 4 = 0'
+                           ELSE ' 6 = 4'  -- @MSSQLVersion >= 13 
                       END 
                         ,')'
                     );
@@ -1031,7 +1050,7 @@ BEGIN TRY
                 WHERE rowNumber = @dbCounter;
 
                 IF @debug = 1
-                PRINT('--List loaded natively compiled modules in this database (@Version >= 13)' + @crlf + @sql + @crlf);
+                PRINT('--List loaded natively compiled modules in this database (@MSSQLVersion >= 13)' + @crlf + @sql + @crlf);
                 ELSE 
                 BEGIN
 
@@ -1095,7 +1114,7 @@ BEGIN TRY
             */
 
             -- temporal is supported in SQL 2016+
-            IF @Version >= 13
+            IF @MSSQLVersion >= 13
             BEGIN
 
                 SELECT @sql = 
@@ -1192,7 +1211,7 @@ BEGIN TRY
             #########################################################
             */
 
-            IF @Version >= 13
+            IF @MSSQLVersion >= 13
             BEGIN
     
                 SELECT @sql = 
@@ -1605,7 +1624,8 @@ BEGIN TRY
             IF @RunningOnAzureSQLDB = 1
             BEGIN 
 
-                DELETE @resultsxtp_storage_percent
+                DELETE @resultsxtp_storage_percent;
+
                 INSERT @resultsxtp_storage_percent
                 (
                     databaseName
@@ -1616,7 +1636,7 @@ BEGIN TRY
                       ,end_time
                       ,xtp_storage_percent
                 FROM sys.dm_db_resource_stats
-                WHERE xtp_storage_percent > 0
+                WHERE xtp_storage_percent > 0;
 
                 IF EXISTS(SELECT 1 FROM @resultsxtp_storage_percent)
                 BEGIN 
@@ -1626,7 +1646,7 @@ BEGIN TRY
                           ,xtp_storage_percent
                     FROM @resultsxtp_storage_percent
                     ORDER BY end_time DESC;
-                END
+                END;
 
                 SELECT DB_NAME() AS databaseName
                       ,DBScopedConfig = 'XTP_PROCEDURE_EXECUTION_STATISTICS enabled:'
@@ -1665,7 +1685,7 @@ BEGIN TRY
     ###################################################
     */
 
-    IF @instanceLevelOnly = 1 AND @Version >= 12
+    IF @instanceLevelOnly = 1 AND @MSSQLVersion >= 12
     BEGIN
 
         SELECT @@version AS Version;
@@ -1806,12 +1826,12 @@ BEGIN TRY
                     WHEN @InstancecollectionStatus = 1 THEN 'YES' 
                     ELSE 'NO'
                 END AS [instance-level collection of execution statistics for Native Modules enabled];
-        END
+        END;
         ELSE
         BEGIN 
             -- repeating this from the database section if we are running @instanceLevelOnly = 1
 
-                DELETE @resultsxtp_storage_percent
+                DELETE @resultsxtp_storage_percent;
 
                 INSERT @resultsxtp_storage_percent
                 (
@@ -1823,7 +1843,7 @@ BEGIN TRY
                       ,end_time
                       ,xtp_storage_percent
                 FROM sys.dm_db_resource_stats
-                WHERE xtp_storage_percent > 0
+                WHERE xtp_storage_percent > 0;
 
                 IF EXISTS(SELECT 1 FROM @resultsxtp_storage_percent)
                 BEGIN 
@@ -1833,7 +1853,7 @@ BEGIN TRY
                           ,xtp_storage_percent
                     FROM @resultsxtp_storage_percent
                     ORDER BY end_time DESC;
-                END
+                END;
 
             SELECT DB_NAME() AS databaseName
                   ,DBScopedConfig = 'XTP_PROCEDURE_EXECUTION_STATISTICS enabled:'
@@ -2007,7 +2027,16 @@ BEGIN TRY
             SELECT *
             FROM sys.event_notifications;
         END;
-    END; -- @instanceLevelOnly = 1 AND @Version >= 12
+    END; -- @instanceLevelOnly = 1 AND @MSSQLVersion >= 12
+
+	SELECT
+		'Thanks for using sp_BlitzInMemoryOLTP!' AS [Thanks],
+		'From Your Community Volunteers' AS [From],
+		'http://FirstResponderKit.org' AS [At],
+		'We hope you found this tool useful. Current version: ' 
+			+ @ScriptVersion + ' released on ' + CONVERT(NVARCHAR(30), @VersionDate) + '.' AS [Version];
+	
+
 END TRY
 
 BEGIN CATCH
